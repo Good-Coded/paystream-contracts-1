@@ -3103,3 +3103,586 @@ fn test_set_low_balance_threshold_negative_rejected() {
     client.set_low_balance_threshold(&employer, &id, &-1);
 }
 
+
+// ---------------------------------------------------------------------------
+// TEST-26 (#249): Two-step admin transfer with nonce validation edge cases
+// ---------------------------------------------------------------------------
+
+/// Full happy-path: propose then accept successfully transfers admin.
+#[test]
+fn test_two_step_admin_transfer_full_happy_path() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    assert_eq!(client.admin(), admin);
+    assert_eq!(client.admin_nonce(), 0);
+
+    // Step 1: current admin proposes new_admin, consuming nonce 0
+    client.propose_admin(&new_admin, &0);
+    assert_eq!(client.admin_nonce(), 1);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    // Step 2: new_admin accepts with the nonce that was active at proposal time (0)
+    client.accept_admin(&new_admin, &0);
+
+    // Pending admin is cleared
+    assert!(client.get_pending_admin().is_none());
+    // new_admin is now the admin
+    assert_eq!(client.admin(), new_admin);
+
+    // new_admin can exercise admin-only ops using the current nonce (1)
+    client.set_min_deposit(&new_admin, &1, &100);
+    assert_eq!(client.admin_nonce(), 2);
+}
+
+/// accept_admin with a wrong nonce panics with E024.
+#[test]
+#[should_panic(expected = "E024")]
+fn test_two_step_admin_accept_wrong_nonce_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    // propose stores pending-nonce = 0
+    client.propose_admin(&new_admin, &0);
+
+    // supply nonce 5 instead of 0 → E024
+    client.accept_admin(&new_admin, &5);
+}
+
+/// accept_admin called by the wrong address panics with E011.
+#[test]
+#[should_panic(expected = "E011")]
+fn test_two_step_admin_accept_wrong_address_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    client.initialize(&admin);
+
+    client.propose_admin(&new_admin, &0);
+
+    // attacker tries to accept → E011 (not the pending admin)
+    client.accept_admin(&attacker, &0);
+}
+
+/// Double-accept after a successful transfer panics with E010 (no pending admin).
+#[test]
+#[should_panic(expected = "E010")]
+fn test_two_step_admin_double_accept_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    client.propose_admin(&new_admin, &0);
+    client.accept_admin(&new_admin, &0); // first accept — clears pending
+
+    // Second accept: no pending admin exists → E010
+    client.accept_admin(&new_admin, &0);
+}
+
+/// A second propose_admin overwrites the first; the new nonce must be used.
+/// The old pending-admin nonce is replaced, so accepting with the old nonce fails.
+#[test]
+fn test_two_step_admin_second_propose_overwrites_first() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let first_candidate = Address::generate(&env);
+    let second_candidate = Address::generate(&env);
+    client.initialize(&admin);
+
+    // First proposal consumes nonce 0; stores pending-nonce 0
+    client.propose_admin(&first_candidate, &0);
+    assert_eq!(client.admin_nonce(), 1);
+    assert_eq!(client.get_pending_admin(), Some(first_candidate.clone()));
+
+    // Second proposal consumes nonce 1; overwrites pending admin and stores pending-nonce 1
+    client.propose_admin(&second_candidate, &1);
+    assert_eq!(client.admin_nonce(), 2);
+    assert_eq!(client.get_pending_admin(), Some(second_candidate.clone()));
+
+    // second_candidate accepts with nonce 1 (the one stored by the second proposal)
+    client.accept_admin(&second_candidate, &1);
+    assert_eq!(client.admin(), second_candidate);
+}
+
+// ---------------------------------------------------------------------------
+// TEST-28 (#251): settle_stream edge cases
+// ---------------------------------------------------------------------------
+
+/// settle_stream before stop_time panics.
+#[test]
+#[should_panic(expected = "stop_time not reached")]
+fn test_settle_stream_before_stop_time() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let now = env.ledger().timestamp();
+    let stop = now + 500;
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &stop, &None);
+
+    // Still before stop_time — must panic
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.settle_stream(&id);
+}
+
+/// settle_stream on a Cancelled stream panics.
+#[test]
+#[should_panic(expected = "stream not active")]
+fn test_settle_stream_on_cancelled_stream_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let now = env.ledger().timestamp();
+    let stop = now + 100;
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &stop, &None);
+
+    client.cancel_stream(&employer, &id);
+    assert_eq!(client.get_stream(&id).status, StreamStatus::Cancelled);
+
+    env.ledger().with_mut(|l| l.timestamp = stop + 10);
+    client.settle_stream(&id); // must panic: stream not active
+}
+
+/// settle_stream on an already-Exhausted stream panics.
+#[test]
+#[should_panic(expected = "stream not active")]
+fn test_settle_stream_on_exhausted_stream_panics() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+
+    let now = env.ledger().timestamp();
+    let stop = now + 50;
+    // 500 tokens, 10/s over 50 s fully exhausts the stream
+    let id = client.create_stream(&employer, &employee, &token_id, &500, &10, &stop, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = stop + 5);
+    // First settle exhausts the stream
+    client.settle_stream(&id);
+    assert_eq!(client.get_stream(&id).status, StreamStatus::Exhausted);
+
+    // Second settle must panic: stream not active
+    client.settle_stream(&id);
+}
+
+/// settle_stream with remaining claimable > 0 pays the employee before
+/// transitioning the stream to Exhausted.
+#[test]
+fn test_settle_stream_with_claimable_pays_employee() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+
+    let now = env.ledger().timestamp();
+    let stop = now + 100;
+    // 2_000 tokens, 10/s, stop at +100 s → max claimable = 1_000; remaining 1_000 is "unearned"
+    let id = client.create_stream(&employer, &employee, &token_id, &2_000, &10, &stop, &None);
+
+    // Advance 50 s, then settle (past stop — we jump to stop + 1)
+    env.ledger().with_mut(|l| l.timestamp = stop + 1);
+
+    let token = paystream_token::TokenContractClient::new(&env, &token_id);
+    let balance_before = token.balance(&employee);
+
+    client.settle_stream(&id);
+
+    let stream = client.get_stream(&id);
+    assert_eq!(stream.status, StreamStatus::Exhausted);
+    // Employee earned 100 s × 10/s = 1_000 tokens
+    assert_eq!(stream.withdrawn, 1_000);
+    assert_eq!(token.balance(&employee), balance_before + 1_000);
+}
+
+/// settle_stream emits the correct status-changed event (Exhausted).
+#[test]
+fn test_settle_stream_emits_status_event() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{symbol_short, vec, IntoVal};
+
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    client.set_min_deposit(&admin, &0, &100);
+
+    let now = env.ledger().timestamp();
+    let stop = now + 50;
+    let id = client.create_stream(&employer, &employee, &token_id, &1_000, &10, &stop, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = stop + 1);
+    client.settle_stream(&id);
+
+    let expected_topics = vec![
+        &env,
+        symbol_short!("v1").into_val(&env),
+        symbol_short!("status").into_val(&env),
+        id.into_val(&env),
+    ];
+    let events = env.events().all();
+    assert!(
+        events
+            .iter()
+            .any(|(_, topics, _)| *topics == expected_topics),
+        "expected a status event for stream {id} but none was found"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TEST-29 (#252): Receipt transfer and withdraw-by-holder
+// ---------------------------------------------------------------------------
+
+/// Original employee can withdraw before any receipt transfer.
+#[test]
+fn test_receipt_original_employee_can_withdraw_before_transfer() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    let withdrawn = client.withdraw(&employee, &id);
+    assert_eq!(withdrawn, 1_000); // 100 s × 10/s
+    assert_eq!(client.receipt_owner(&id), employee);
+}
+
+/// After a receipt transfer, the new holder can withdraw.
+#[test]
+fn test_receipt_new_holder_can_withdraw_after_transfer() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let new_holder = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+
+    // Transfer receipt from employee to new_holder
+    client.transfer_receipt(&employee, &new_holder, &id);
+    assert_eq!(client.receipt_owner(&id), new_holder);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    let withdrawn = client.withdraw(&new_holder, &id);
+    assert_eq!(withdrawn, 1_000);
+}
+
+/// Original employee cannot withdraw after transferring the receipt away.
+#[test]
+#[should_panic(expected = "E016")]
+fn test_receipt_original_employee_cannot_withdraw_after_transfer() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let new_holder = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+
+    client.transfer_receipt(&employee, &new_holder, &id);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    // Original employee no longer holds the receipt — must panic E016
+    client.withdraw(&employee, &id);
+}
+
+/// transfer_receipt emits a receipt_transferred event with correct from/to.
+#[test]
+fn test_receipt_transfer_emits_event() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{symbol_short, IntoVal};
+
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let new_holder = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+
+    client.transfer_receipt(&employee, &new_holder, &id);
+
+    let events = env.events().all();
+    // Events for receipt_transferred use ("receipt", id) as topics
+    let transfer_event = events.iter().find(|(_, topics, _)| {
+        topics.len() == 2
+            && topics
+                .get(0)
+                .map(|t| {
+                    use soroban_sdk::TryIntoVal;
+                    let sym: Result<soroban_sdk::Symbol, _> = t.try_into_val(&env);
+                    sym.map(|s| s == symbol_short!("receipt")).unwrap_or(false)
+                })
+                .unwrap_or(false)
+            && topics
+                .get(1)
+                .map(|t| {
+                    use soroban_sdk::TryIntoVal;
+                    let found_id: Result<u64, _> = t.try_into_val(&env);
+                    found_id.map(|v| v == id).unwrap_or(false)
+                })
+                .unwrap_or(false)
+    });
+    assert!(transfer_event.is_some(), "receipt_transferred event not emitted");
+
+    // Verify the data payload contains (from, to)
+    let (_, _, data) = transfer_event.unwrap();
+    let (from_addr, to_addr): (Address, Address) = data.into_val(&env);
+    assert_eq!(from_addr, employee);
+    assert_eq!(to_addr, new_holder);
+}
+
+/// withdraw_all only pays the current receipt holder, not the original employee.
+#[test]
+fn test_receipt_withdraw_all_respects_holder() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let new_holder = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+    let _id = client.create_stream(&employer, &employee, &token_id, &10_000, &10, &0, &None);
+
+    // Transfer receipt to new_holder
+    client.transfer_receipt(&employee, &new_holder, &_id);
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    // Original employee's withdraw_all should skip the stream (no longer the holder)
+    let employee_results = client.withdraw_all(&employee);
+    assert_eq!(employee_results.len(), 0);
+
+    // New holder's withdraw_all should succeed
+    let holder_results = client.withdraw_all(&new_holder);
+    assert_eq!(holder_results.len(), 1);
+    assert_eq!(holder_results.get(0).unwrap().1, 1_000);
+}
+
+// ---------------------------------------------------------------------------
+// TEST-30 (#253): Differential test — claimable() vs pure-Rust reference impl
+// ---------------------------------------------------------------------------
+
+/// Reference implementation of the claimable calculation in pure Rust.
+/// Mirrors the contract's storage::claimable_amount logic exactly.
+///
+/// Returns `None` when an arithmetic overflow would occur (which the contract
+/// handles with a panic; the differential test skips those cases).
+fn claimable_ref(
+    deposit: i128,
+    withdrawn: i128,
+    rate_per_second: i128,
+    last_withdraw_time: u64,
+    stop_time: u64,   // 0 = no stop
+    now: u64,
+    pending_accrual: i128,
+) -> Option<i128> {
+    // Cap elapsed time at stop_time if applicable
+    let effective_now = if stop_time > 0 && now > stop_time {
+        stop_time
+    } else {
+        now
+    };
+    let elapsed = effective_now.saturating_sub(last_withdraw_time) as i128;
+
+    // Overflow check matching the contract's checked_mul / panic behaviour
+    let new_accrual = rate_per_second.checked_mul(elapsed)?;
+    let total_accrual = pending_accrual.checked_add(new_accrual)?;
+
+    let remaining = deposit.checked_sub(withdrawn)?;
+    Some(total_accrual.min(remaining).max(0))
+}
+
+/// Deterministic PRNG used in the differential test to avoid depending on
+/// the `rand` crate, which is not in scope for the contract build.
+struct SimplePrng(u64);
+
+impl SimplePrng {
+    fn next(&mut self) -> u64 {
+        // xorshift64 — fast, good enough for test case generation
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn next_range(&mut self, lo: u64, hi: u64) -> u64 {
+        lo + self.next() % (hi - lo + 1)
+    }
+
+    fn next_i128_range(&mut self, lo: i128, hi: i128) -> i128 {
+        let range = (hi - lo + 1) as u64;
+        lo + (self.next() % range) as i128
+    }
+}
+
+/// Differential test: run 1000+ random (deposit, rate, elapsed, stop_time,
+/// pending_accrual) tuples through both the reference implementation and the
+/// contract's claimable() query, asserting they match.
+///
+/// Cases that would overflow i128 are skipped by both implementations.
+#[test]
+fn test_differential_claimable_vs_reference() {
+    use crate::storage::claimable_amount;
+    use crate::types::{Stream, StreamStatus};
+
+    let env = Env::default();
+    let addr = Address::generate(&env);
+
+    let mut rng = SimplePrng(0xdeadbeef_cafebabe);
+    let mut cases_run = 0u32;
+    let mut cases_skipped = 0u32;
+
+    for _ in 0..1200 {
+        // Generate random parameters with wide but realistic ranges
+        let deposit = rng.next_i128_range(1, 1_000_000_000);
+        let rate = rng.next_i128_range(1, 1_000_000);
+        let withdrawn = rng.next_i128_range(0, deposit);
+        let pending_accrual = rng.next_i128_range(0, deposit - withdrawn);
+
+        let last_withdraw_time: u64 = rng.next_range(0, 1_000_000);
+        let elapsed: u64 = rng.next_range(0, 10_000);
+        let now = last_withdraw_time + elapsed;
+
+        // 30% of cases use a stop_time
+        let stop_time: u64 = if rng.next() % 10 < 3 {
+            // stop_time somewhere in the past, present, or future relative to now
+            let offset = rng.next_range(0, elapsed + 1000);
+            last_withdraw_time + offset
+        } else {
+            0
+        };
+
+        // Compute expected value from reference; skip overflow cases
+        let expected = match claimable_ref(
+            deposit,
+            withdrawn,
+            rate,
+            last_withdraw_time,
+            stop_time,
+            now,
+            pending_accrual,
+        ) {
+            Some(v) => v,
+            None => {
+                cases_skipped += 1;
+                continue;
+            }
+        };
+
+        // Build a Stream struct for the internal helper
+        let stream = Stream {
+            id: 1,
+            employer: addr.clone(),
+            employee: addr.clone(),
+            token: addr.clone(),
+            deposit,
+            withdrawn,
+            rate_per_second: rate,
+            start_time: 0,
+            stop_time,
+            last_withdraw_time,
+            status: StreamStatus::Active,
+            locked: false,
+            low_balance_threshold: 0,
+            pending_accrual,
+        };
+
+        let contract_result = claimable_amount(&stream, now);
+
+        assert_eq!(
+            contract_result,
+            expected,
+            "divergence at case {cases_run}: \
+             deposit={deposit}, rate={rate}, withdrawn={withdrawn}, \
+             pending_accrual={pending_accrual}, elapsed={elapsed}, \
+             stop_time={stop_time}, now={now} \
+             → contract={contract_result}, reference={expected}"
+        );
+
+        cases_run += 1;
+    }
+
+    assert!(
+        cases_run >= 1000,
+        "expected at least 1000 non-overflow cases, got {cases_run} (skipped {cases_skipped})"
+    );
+}
+
+/// Differential test: paused streams accrue zero tokens during the pause window.
+/// Validates that resuming a stream resets last_withdraw_time so pause duration
+/// is correctly excluded from the claimable calculation.
+#[test]
+fn test_differential_claimable_paused_streams() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    let employer = Address::generate(&env);
+    let employee = Address::generate(&env);
+    let token_id = setup_token(&env, &employer);
+
+    client.initialize(&admin);
+
+    // rate = 7/s, deposit large enough not to exhaust
+    let rate: i128 = 7;
+    let id = client.create_stream(&employer, &employee, &token_id, &1_000_000, &rate, &0, &None);
+
+    // Active for 100 s → 700 accrued
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    let expected_active = 700i128;
+    assert_eq!(client.claimable(&id), expected_active);
+
+    // Pause for 300 s — no accrual
+    client.pause_stream(&employer, &id);
+    env.ledger().with_mut(|l| l.timestamp += 300);
+    // Still 700 claimable (paused time excluded)
+    assert_eq!(client.claimable(&id), expected_active);
+
+    // Resume and run for 50 s → 700 + 350 = 1050; but last_withdraw_time resets to resume time
+    client.resume_stream(&employer, &id);
+    env.ledger().with_mut(|l| l.timestamp += 50);
+    let expected_after_resume = 50 * rate; // 350; pre-pause accrual already tracked via pending_accrual
+    // After resume, last_withdraw_time is reset so only post-resume seconds count for the rate calc
+    // But pending_accrual banks the 700 from before the pause
+    let contract_val = client.claimable(&id);
+    // Reference: pending_accrual (700) + 50 * 7 (350) = 1050
+    assert_eq!(
+        contract_val,
+        expected_active + expected_after_resume,
+        "paused differential mismatch: contract={contract_val}"
+    );
+}
